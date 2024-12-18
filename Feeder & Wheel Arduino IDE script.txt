@@ -1,0 +1,420 @@
+#include <Wire.h>
+#include <RTClib.h>
+#include <SPI.h>
+#include <SD.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+
+RTC_DS3231 rtc;
+File myFile;
+WebServer server(80);
+Servo motorServo1;  // Motor Feeder 1
+Servo motorServo2;  // Motor Feeder 2
+
+// Pines
+const int sensorPin1 = 33; // Pin GPIO33 for Running wheel 1
+const int sensorPin2 = 25;  // Pin GPIO25 for Running wheel 2
+const int ledPinRecording = 35;  // LED indicating recording in progress
+const int ledPinNotRecording = 14;  // LED indicating no recording
+const int chipSelect = 5;
+const int servoPin1 = 27; //GPIO27 pin for Feeder Motor 1
+const int servoPin2 = 26; // GPIO27 pin for Feeder Motor 2
+
+int horaAperturaMotor1, minutoAperturaMotor1;
+int horaCierreMotor1, minutoCierreMotor1;
+
+int horaAperturaMotor2, minutoAperturaMotor2;
+int horaCierreMotor2, minutoCierreMotor2;
+
+int anguloAperturaMotor1 = 0; 
+int anguloCierreMotor1 = 100;   
+int anguloAperturaMotor2 = 0; 
+int anguloCierreMotor2 = 100;    
+DateTime openTime;
+DateTime closeTime;
+
+volatile int count1 = 0;
+volatile int count2 = 0;
+unsigned long lastMillis = 0;
+bool recording = false;
+bool testing = false;
+char filename[30];
+
+volatile unsigned long lastContactTime1 = 0;
+volatile unsigned long lastContactTime2 = 0;
+const unsigned long debounceDelay = 250; 
+
+const char* ssid = "Feeder&Wheel_1";
+const char* password = "123456789";
+
+void IRAM_ATTR isr1() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastContactTime1 > debounceDelay) {
+    count1++;
+    lastContactTime1 = currentMillis;
+  }
+}
+
+void IRAM_ATTR isr2() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastContactTime2 > debounceDelay) {
+    count2++;
+    lastContactTime2 = currentMillis;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(sensorPin1, INPUT_PULLUP);
+  pinMode(sensorPin2, INPUT_PULLUP);
+  pinMode(ledPinRecording, OUTPUT);
+  pinMode(ledPinNotRecording, OUTPUT);
+  
+  attachInterrupt(digitalPinToInterrupt(sensorPin1), isr1, FALLING);
+  attachInterrupt(digitalPinToInterrupt(sensorPin2), isr2, FALLING);
+
+  if (!SD.begin(chipSelect)) {
+    Serial.println("Error Initializing SD");
+    return;
+  }
+
+  if (!rtc.begin()) {
+    Serial.println("Error Initializing RTC");
+    return;
+  }
+  
+  WiFi.softAP(ssid, password);
+  Serial.println("WiFi Network Created");
+
+  motorServo1.attach(servoPin1);
+  motorServo2.attach(servoPin2);
+  
+  server.on("/", handleRoot);
+  server.on("/time", handleTime);
+  server.on("/settime", handleSetTime);
+  server.on("/start", handleStart);
+  server.on("/stop", handleStop);
+  server.on("/download", handleDownload);
+  server.on("/file", handleFileDownload);
+  server.on("/test", handleTest);
+  server.on("/test/refresh", handleTestRefresh);
+  
+  server.on("/configurarCompuerta", HTTP_GET, handleConfigurarCompuerta);
+  server.on("/guardarConfiguracion", HTTP_GET, handleGuardarConfiguracion);
+  server.on("/testCompuerta", HTTP_GET, handleTestCompuerta);
+  server.on("/abrirCompuerta1", HTTP_GET, abrirCompuerta1);
+  server.on("/cerrarCompuerta1", HTTP_GET, cerrarCompuerta1);
+  server.on("/abrirCompuerta2", HTTP_GET, abrirCompuerta2);
+  server.on("/cerrarCompuerta2", HTTP_GET, cerrarCompuerta2);
+  
+  server.begin();
+  Serial.println("WIFI network started");
+
+  digitalWrite(ledPinRecording, LOW);
+  digitalWrite(ledPinNotRecording, HIGH);
+}
+
+void loop() {
+  server.handleClient();
+  
+  controlarCompuertaPorHorario();
+
+  if (recording && (millis() - lastMillis >= 60000)) {
+    lastMillis = millis();
+    
+    DateTime now = rtc.now();
+    myFile = SD.open(filename, FILE_APPEND);
+    
+    if (myFile) {
+      myFile.printf("%02d/%02d/%04d,%02d:%02d:%02d,%d,%d\n", now.day(), now.month(), now.year(), now.hour(), now.minute(), now.second(), 1, count1);
+      myFile.printf("%02d/%02d/%04d,%02d:%02d:%02d,%d,%d\n", now.day(), now.month(), now.year(), now.hour(), now.minute(), now.second(), 2, count2);
+      myFile.close();
+    } else {
+      Serial.println("Error opening file");
+    }
+    
+    count1 = 0;
+    count2 = 0;
+    
+  }
+}
+
+void controlarCompuertaPorHorario() {
+  DateTime now = rtc.now();
+  int horaActual = now.hour();
+  int minutoActual = now.minute();
+
+  if (horaActual == horaAperturaMotor1 && minutoActual == minutoAperturaMotor1) {
+    abrirCompuerta1();
+  } else if (horaActual == horaCierreMotor1 && minutoActual == minutoCierreMotor1) {
+    cerrarCompuerta1();
+  }
+
+  if (horaActual == horaAperturaMotor2 && minutoActual == minutoAperturaMotor2) {
+    abrirCompuerta2();
+  } else if (horaActual == horaCierreMotor2 && minutoActual == minutoCierreMotor2) {
+    cerrarCompuerta2();
+  }
+}
+
+void handleRoot() {
+  DateTime now = rtc.now();
+  String date = String(now.day()) + "/" + String(now.month()) + "/" + String(now.year());
+  String time = String(now.hour()) + ":" + String(now.minute()) + ":" + String(now.second());
+
+  String recordingStatus = recording ? "Recording: " + String(filename) : "No ongoing recording";
+
+  String horarioMotor1 = "Gate 1 - Opening: " + String(horaAperturaMotor1) + ":" + (minutoAperturaMotor1 < 10 ? "0" : "") + String(minutoAperturaMotor1);
+  horarioMotor1 += " | Closing: " + String(horaCierreMotor1) + ":" + (minutoCierreMotor1 < 10 ? "0" : "") + String(minutoCierreMotor1);
+  
+  String horarioMotor2 = "Gate 2 - Opening: " + String(horaAperturaMotor2) + ":" + (minutoAperturaMotor2 < 10 ? "0" : "") + String(minutoAperturaMotor2);
+  horarioMotor2 += " | Closing: " + String(horaCierreMotor2) + ":" + (minutoCierreMotor2 < 10 ? "0" : "") + String(minutoCierreMotor2);
+
+  String html = "<html><head><style>";
+  html += "body { font-family: Arial, sans-serif; text-align: center; background-color: #e0e0e0; }";
+  html += "h1 { color: #333; }";
+  html += "button { margin: 10px; padding: 10px 20px; border: none; border-radius: 5px; color: #fff; background-color: #007bff; cursor: pointer; }";
+  html += "button:hover { background-color: #0056b3; }";
+  html += "div { margin: 20px 0; }";
+  html += "span { display: block; margin: 10px 0; }";
+  html += "</style></head><body>";
+  html += "<h1>Feeder & Wheel 1</h1>";
+  html += "<div><span>Date: " + date + "</span></div>";
+  html += "<div><span>Time: " + time + "</span></div>";
+  html += "<div><span>" + recordingStatus + "</span></div>";
+  html += "<p>Opening Schedule:</p>";
+  html += "<p>" + horarioMotor1 + "</p>";
+  html += "<p>" + horarioMotor2 + "</p>";
+  html += "<button onclick=\"window.location.href='/settime'\">Set Date and Time</button>";
+  html += "<button onclick=\"window.location.href='/start'\">Start Recording</button>";
+  html += "<button onclick=\"window.location.href='/stop'\">Stop Recording</button>";
+  html += "<button onclick=\"window.location.href='/download'\">Download Files</button>";
+  html += "<button onclick=\"window.location.href='/configurarCompuerta'\">Configure Gate</button>";
+  html += "<button onclick=\"window.location.href='/testCompuerta'\">Gate Test</button>";
+  html += "<button onclick=\"window.location.href='/test'\">Sensor Test</button>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+
+String formatTime(DateTime time) {
+  return String(time.hour()) + ":" + (time.minute() < 10 ? "0" : "") + String(time.minute());
+}
+
+void handleTime() {
+  DateTime now = rtc.now();
+  String html = "<html><body><h1>Actual time</h1>";
+  html += "<p>Actual time is: " + String(now.hour()) + ":" + String(now.minute()) + ":" + String(now.second()) + "</p>";
+  html += "<button onclick=\"window.location.href='/settime'\">Set time</button>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSetTime() {
+  if (server.hasArg("date") && server.hasArg("time")) {
+    String dateStr = server.arg("date");
+    String timeStr = server.arg("time");
+
+    int day = dateStr.substring(0, 2).toInt();
+    int month = dateStr.substring(3, 5).toInt();
+    int year = dateStr.substring(6).toInt();
+    int hour = timeStr.substring(0, 2).toInt();
+    int minute = timeStr.substring(3, 5).toInt();
+    int second = timeStr.substring(6).toInt();
+
+    rtc.adjust(DateTime(year, month, day, hour, minute, second));
+
+    server.send(200, "text/plain", "Date and time updated:" + dateStr + " " + timeStr);
+  } else {
+    String dateTime = String(rtc.now().day()) + "/" + String(rtc.now().month()) + "/" + String(rtc.now().year()) + " " + String(rtc.now().hour()) + ":" + String(rtc.now().minute()) + ":" + String(rtc.now().second());
+    
+    String html = "<html><head><style>";
+    html += "body { font-family: Arial, sans-serif; text-align: center; background-color: #e0e0e0; }";
+    html += "h1 { color: #333; }";
+    html += "button { margin: 10px; padding: 10px 20px; border: none; border-radius: 5px; color: #fff; background-color: #007bff; cursor: pointer; }";
+    html += "button:hover { background-color: #0056b3; }";
+    html += "</style></head><body>";
+    html += "<h1>Set Date and Time</h1>";
+    html += "<div><span>Current date and time: " + dateTime + "</span></div>";
+    html += "<form action=\"/settime\" method=\"get\">";
+    html += "<label for=\"date\">Date (dd/mm/yyyy):</label>";
+    html += "<input type=\"text\" id=\"date\" name=\"date\"><br><br>";
+    html += "<label for=\"time\">Time (hh:mm:ss):</label>";
+    html += "<input type=\"text\" id=\"time\" name=\"time\"><br><br>";
+    html += "<input type=\"submit\" value=\"Save\">";
+    html += "</form>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+  }
+}
+
+
+void handleStart() {
+  if (!recording) {
+    DateTime now = rtc.now();
+    sprintf(filename, "/FW1_%02d%02d%02d_%02d%02d%02d.txt", now.day(), now.month(), now.year(), now.hour(), now.minute(), now.second());
+    myFile = SD.open(filename, FILE_WRITE);
+    if (myFile) {
+      myFile.println("Date,Time,Sensor,RPM");
+      myFile.close();
+      recording = true;
+      digitalWrite(ledPinRecording, HIGH);
+      digitalWrite(ledPinNotRecording, LOW);
+      lastMillis = millis();
+      server.send(200, "text/plain", "Recording started: " + String(filename));
+    } else {
+      server.send(500, "text/plain", "Error starting recording");
+    }
+  } else {
+    server.send(200, "text/plain", "A recording is already in progress");
+  }
+}
+
+void handleStop() {
+  if (recording) {
+    recording = false;
+    digitalWrite(ledPinRecording, LOW);
+    digitalWrite(ledPinNotRecording, HIGH);
+    server.send(200, "text/plain", "Recording stopped");
+  } else {
+    server.send(200, "text/plain", "No recording in progress");
+  }
+}
+
+
+void handleConfigurarCompuerta() {
+  String html = "<html><body>";
+  html += "<form action=\"/guardarConfiguracion\" method=\"GET\">";
+  html += "Opening time gate 1: <input type='number' name='horaAperturaM1' min='0' max='23' required> : <input type='number' name='minutoAperturaM1' min='0' max='59' required><br>";
+  html += "Closing time gate 1: <input type='number' name='horaCierreM1' min='0' max='23' required> : <input type='number' name='minutoCierreM1' min='0' max='59' required><br>";
+  html += "Opening time gate 2: <input type='number' name='horaAperturaM2' min='0' max='23' required> : <input type='number' name='minutoAperturaM2' min='0' max='59' required><br>";
+  html += "Closing time gate 2: <input type='number' name='horaCierreM2' min='0' max='23' required> : <input type='number' name='minutoCierreM2' min='0' max='59' required><br>";
+  html += "<button type='submit'>Save</button>";
+  html += "</form>";
+  html += "</body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+
+
+void handleGuardarConfiguracion() {
+  horaAperturaMotor1 = server.arg("horaAperturaM1").toInt();
+  minutoAperturaMotor1 = server.arg("minutoAperturaM1").toInt();
+  horaCierreMotor1 = server.arg("horaCierreM1").toInt();
+  minutoCierreMotor1 = server.arg("minutoCierreM1").toInt();
+
+  horaAperturaMotor2 = server.arg("horaAperturaM2").toInt();
+  minutoAperturaMotor2 = server.arg("minutoAperturaM2").toInt();
+  horaCierreMotor2 = server.arg("horaCierreM2").toInt();
+  minutoCierreMotor2 = server.arg("minutoCierreM2").toInt();
+
+  server.send(200, "text/plain", "Saved Configuration");
+}
+
+
+void handleTestCompuerta() {
+  String html = "<html><head><style>";
+  html += "body { font-family: Arial, sans-serif; text-align: center; background-color: #e0e0e0; }";
+  html += "h1 { color: #333; }";
+  html += "button { padding: 10px 20px; background-color: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; }";
+  html += "button:hover { background-color: #0056b3; }";
+  html += "</style></head><body>";
+  html += "<h1>Gate Test</h1>";
+  html += "<button onclick=\"window.location.href='/abrirCompuerta1'\">Open Gate 1</button><br><br>";
+  html += "<button onclick=\"window.location.href='/cerrarCompuerta1'\">Close Gate 1</button><br><br>";
+  html += "<button onclick=\"window.location.href='/abrirCompuerta2'\">Open Gate 2</button><br><br>";
+  html += "<button onclick=\"window.location.href='/cerrarCompuerta2'\">Close Gate 2</button><br><br>";
+  html += "</body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void abrirCompuerta1() {
+  motorServo1.write(anguloAperturaMotor1);
+  delay(1000);  // 
+  server.send(200, "text/html", "<html><body><h1>Gate 1 Open</h1><button onclick=\"window.location.href='/testCompuerta'\">Back to test</button></body></html>");
+}
+
+void cerrarCompuerta1() {
+  motorServo1.write(anguloCierreMotor1);
+  delay(1000);  // 
+  server.send(200, "text/html", "<html><body><h1>Gate 1 closed</h1><button onclick=\"window.location.href='/testCompuerta'\">Back to test</button></body></html>");
+}
+
+void abrirCompuerta2() {
+  motorServo2.write(anguloAperturaMotor2);
+  delay(1000);  // 
+  server.send(200, "text/html", "<html><body><h1>Gate 2 Open</h1><button onclick=\"window.location.href='/testCompuerta'\">VBack to test</button></body></html>");
+}
+
+void cerrarCompuerta2() {
+  motorServo2.write(anguloCierreMotor2);
+  delay(1000);  // 
+  server.send(200, "text/html", "<html><body><h1>Gate 2 closed</h1><button onclick=\"window.location.href='/testCompuerta'\">Back to test</button></body></html>");
+}
+
+void handleDownload() {
+  String html = "<html><body><h1>Download files</h1><ul>";
+  File root = SD.open("/");
+  File file = root.openNextFile();
+  while (file) {
+    html += "<li><a href=\"/file?path=";
+    html += file.name();
+    html += "\">";
+    html += file.name();
+    html += "</a></li>";
+    file = root.openNextFile();
+  }
+  html += "</ul></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleFileDownload() {
+  if (!SD.begin()) {
+    server.send(500, "text/plain", "Cannot access to SD card");
+    return;
+  }
+
+  if (server.hasArg("path")) {
+    String path = server.arg("path");
+    path.replace("..", "");  
+    if (path.charAt(0) != '/') {
+      path = "/" + path;  
+    }
+
+    File file = SD.open(path);
+    if (file) {
+      String mimeType = "application/octet-stream";  
+      if (path.endsWith(".txt")) mimeType = "text/plain";
+      else if (path.endsWith(".html")) mimeType = "text/html";
+      else if (path.endsWith(".jpg")) mimeType = "image/jpeg";
+      else if (path.endsWith(".png")) mimeType = "image/png";
+
+      String fileName = path.substring(path.lastIndexOf('/') + 1);
+      server.sendHeader("Content-Disposition", "attachment; filename=" + fileName);
+      server.streamFile(file, mimeType);
+      
+      file.close();
+    } else {
+      server.send(404, "text/plain", "File not found");
+    }
+  } else {
+    server.send(400, "text/plain", "Invalid request");
+  }
+}
+
+void handleTest() {
+  String html = "<html><body><h1>Sensor Test</h1><p> Sensor 1: " + String(count1) + "</p><p>Sensor 2: " + String(count2) + "</p><button onclick=\"window.location.href='/test'\">Refresh</button></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleTestRefresh() {
+  String testInfo = "{\"sensor1\": " + String(count1) + ", \"sensor2\": " + String(count2) + "}";
+  server.send(200, "application/json", testInfo);
+}
+
+
